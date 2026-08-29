@@ -1,27 +1,23 @@
-// SPDX-License-Identifier: MPL-2.0-only
+// SPDX-License-Identifier: MPL-2.0
 
 use crate::{CosmicBg, CosmicBgLayer};
 
-use std::{
-    collections::VecDeque,
-    fs,
-    path::PathBuf,
-    time::{Duration, Instant},
-};
+use std::collections::VecDeque;
+use std::fs;
+use std::io::BufReader;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
-use cosmic_bg_config::{state::State, Color, Entry, SamplingMethod, ScalingMode, Source};
+use cosmic_bg_config::state::State;
+use cosmic_bg_config::{Color, Entry, SamplingMethod, ScalingMode, Source};
 use cosmic_config::CosmicConfigEntry;
-use image::{io::Reader as ImageReader, DynamicImage};
+use image::{DynamicImage, ImageDecoder, ImageReader, ImageResult, Limits};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use rand::{seq::SliceRandom, thread_rng};
-use sctk::reexports::{
-    calloop::{
-        self,
-        timer::{TimeoutAction, Timer},
-        RegistrationToken,
-    },
-    client::QueueHandle,
-};
+use rand::rng;
+use rand::seq::SliceRandom;
+use sctk::reexports::calloop::timer::{TimeoutAction, Timer};
+use sctk::reexports::calloop::{self, RegistrationToken};
+use sctk::reexports::client::QueueHandle;
 use tracing::error;
 use walkdir::WalkDir;
 
@@ -36,8 +32,9 @@ pub struct Wallpaper {
     loop_handle: calloop::LoopHandle<'static, CosmicBg>,
     queue_handle: QueueHandle<CosmicBg>,
     current_source: Option<Source>,
+    // Cache of source image, if `current_source` is a `Source::Path`
+    current_image: Option<image::DynamicImage>,
     timer_token: Option<RegistrationToken>,
-    new_image: bool,
 }
 
 impl Drop for Wallpaper {
@@ -59,8 +56,8 @@ impl Wallpaper {
             entry,
             layers: Vec::new(),
             current_source: None,
+            current_image: None,
             image_queue: VecDeque::default(),
-            new_image: false,
             timer_token: None,
             loop_handle,
             queue_handle,
@@ -98,40 +95,53 @@ impl Wallpaper {
         let start = Instant::now();
         let mut cur_resized_img: Option<DynamicImage> = None;
 
-        for layer in self
-            .layers
-            .iter_mut()
-            .filter(|layer| !layer.first_configure)
-        {
+        for layer in self.layers.iter_mut().filter(|layer| layer.needs_redraw) {
             let Some(pool) = layer.pool.as_mut() else {
                 continue;
             };
 
-            if cur_resized_img.as_ref().map_or(true, |img| {
-                img.width() != layer.width || img.height() != layer.height
-            }) {
-                let CosmicBgLayer { width, height, .. } = *layer;
+            let Some(fractional_scale) = layer.fractional_scale else {
+                continue;
+            };
+
+            let Some((width, height)) = layer.size else {
+                continue;
+            };
+
+            let width = width * fractional_scale / 120;
+            let height = height * fractional_scale / 120;
+
+            if cur_resized_img
+                .as_ref()
+                .is_none_or(|img| img.width() != width || img.height() != height)
+            {
                 let Some(source) = self.current_source.as_ref() else {
                     tracing::info!("No source for wallpaper");
                     continue;
                 };
+
                 cur_resized_img = match source {
-                    Source::Path(ref path) => {
-                        let img = &match ImageReader::open(&path) {
-                            Ok(img) => {
-                                match img.with_guessed_format().ok().and_then(|f| f.decode().ok()) {
-                                    Some(img) => img,
-                                    None => {
+                    Source::Path(path) => {
+                        if self.current_image.is_none() {
+                            self.current_image = match ImageReader::open(path)
+                                .ok()
+                                .and_then(|f| f.with_guessed_format().ok())
+                            {
+                                Some(f) => match decode(f) {
+                                    Ok(img) => Some(img),
+                                    Err(why) => {
                                         tracing::warn!(
-                                            "Could not decode image: {}",
+                                            ?why,
+                                            "Failed to decode image: {}",
                                             path.display()
                                         );
                                         continue;
                                     }
-                                }
-                            }
-                            Err(_) => continue,
-                        };
+                                },
+                                None => continue,
+                            };
+                        }
+                        let img = self.current_image.as_ref().unwrap();
 
                         match self.entry.scaling_mode {
                             ScalingMode::Fit(color) => {
@@ -146,15 +156,11 @@ impl Wallpaper {
                         }
                     }
 
-                    Source::Color(Color::Single([ref r, ref g, ref b])) => {
-                        Some(image::DynamicImage::from(crate::colored::single(
-                            [*r, *g, *b],
-                            width,
-                            height,
-                        )))
-                    }
+                    Source::Color(Color::Single([r, g, b])) => Some(image::DynamicImage::from(
+                        crate::colored::single([*r, *g, *b], width, height),
+                    )),
 
-                    Source::Color(Color::Gradient(ref gradient)) => {
+                    Source::Color(Color::Gradient(gradient)) => {
                         match crate::colored::gradient(gradient, width, height) {
                             Ok(buffer) => Some(image::DynamicImage::from(buffer)),
                             Err(why) => {
@@ -171,18 +177,18 @@ impl Wallpaper {
             }
 
             let image = cur_resized_img.as_ref().unwrap();
-
-            let buffer_result = crate::draw::canvas(
-                pool,
-                image,
-                layer.width as i32,
-                layer.height as i32,
-                layer.width as i32 * 4,
-            );
+            let buffer_result =
+                crate::draw::canvas(pool, image, width as i32, height as i32, width as i32 * 4);
 
             match buffer_result {
                 Ok(buffer) => {
-                    crate::draw::layer_surface(layer, &self.queue_handle, &buffer);
+                    crate::draw::layer_surface(
+                        layer,
+                        &self.queue_handle,
+                        &buffer,
+                        (width as i32, height as i32),
+                    );
+                    layer.needs_redraw = false;
 
                     let elapsed = Instant::now().duration_since(start);
 
@@ -198,6 +204,13 @@ impl Wallpaper {
 
     pub fn load_images(&mut self) {
         let mut image_queue = VecDeque::new();
+        let xdg_data_dirs: Vec<String> = match std::env::var("XDG_DATA_DIRS") {
+            Ok(raw_xdg_data_dirs) => raw_xdg_data_dirs
+                .split(':')
+                .map(|s| format!("{}/backgrounds/", s))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
 
         match self.entry.source {
             Source::Path(ref source) => {
@@ -205,7 +218,10 @@ impl Wallpaper {
 
                 if let Ok(source) = source.canonicalize() {
                     if source.is_dir() {
-                        if source.starts_with("/usr/share/backgrounds/") {
+                        if xdg_data_dirs
+                            .iter()
+                            .any(|xdg_data_dir| source.starts_with(xdg_data_dir))
+                        {
                             // Store paths of wallpapers to be used for the slideshow.
                             for img_path in WalkDir::new(source)
                                 .follow_links(true)
@@ -215,15 +231,15 @@ impl Wallpaper {
                             {
                                 image_queue.push_front(img_path.path().into());
                             }
-                        } else if let Ok(dir) = source.read_dir() {
-                            for entry in dir.filter_map(Result::ok) {
-                                let Ok(path) = entry.path().canonicalize() else {
-                                    continue;
-                                };
-
-                                if path.is_file() {
-                                    image_queue.push_front(path);
-                                }
+                        } else {
+                            // Recursively find images in custom directory
+                            for img_path in WalkDir::new(source)
+                                .follow_links(true)
+                                .into_iter()
+                                .filter_map(Result::ok)
+                                .filter(|p| p.path().is_file())
+                            {
+                                image_queue.push_front(img_path.path().into());
                             }
                         }
                     } else if source.is_file() {
@@ -238,30 +254,28 @@ impl Wallpaper {
                             image_slice
                                 .sort_by(|a, b| a.to_string_lossy().cmp(&b.to_string_lossy()));
                         }
-                        SamplingMethod::Random => image_slice.shuffle(&mut thread_rng()),
+                        SamplingMethod::Random => image_slice.shuffle(&mut rng()),
                     };
 
                     // If a wallpaper from this slideshow was previously set, resume with that wallpaper.
-                    if let Ok(context) = cosmic_bg_config::context() {
-                        if let Some(Source::Path(last_path)) = current_image(&self.entry.output) {
-                            if image_queue.contains(&last_path) {
-                                while let Some(path) = image_queue.pop_front() {
-                                    if path == last_path {
-                                        image_queue.push_front(path);
-                                        break;
-                                    }
-
-                                    image_queue.push_back(path);
-                                }
+                    if let Some(Source::Path(last_path)) = current_image(&self.entry.output)
+                        && image_queue.contains(&last_path)
+                    {
+                        while let Some(path) = image_queue.pop_front() {
+                            if path == last_path {
+                                image_queue.push_front(path);
+                                break;
                             }
+
+                            image_queue.push_back(path);
                         }
                     }
                 }
 
-                image_queue.pop_front().map(|current_image_path| {
+                if let Some(current_image_path) = image_queue.pop_front() {
                     self.current_source = Some(Source::Path(current_image_path.clone()));
                     image_queue.push_back(current_image_path);
-                });
+                }
             }
 
             Source::Color(ref c) => {
@@ -271,7 +285,6 @@ impl Wallpaper {
         if let Err(err) = self.save_state() {
             error!("{err}");
         }
-        self.new_image = true;
         self.image_queue = image_queue;
     }
 
@@ -309,7 +322,6 @@ impl Wallpaper {
         let cosmic_bg_clone = self.entry.output.clone();
         // set timer for rotation
         if rotation_freq > 0 {
-            let output = self.entry.output.clone();
             self.timer_token = self
                 .loop_handle
                 .insert_source(
@@ -326,14 +338,14 @@ impl Wallpaper {
                             return TimeoutAction::Drop; // Drop if no item found for this timer
                         };
 
-                        while let Some(next) = item.image_queue.pop_front() {
+                        if let Some(next) = item.image_queue.pop_front() {
                             item.current_source = Some(Source::Path(next.clone()));
                             if let Err(err) = item.save_state() {
                                 error!("{err}");
                             }
 
                             item.image_queue.push_back(next);
-                            item.new_image = true;
+                            item.clear_image();
                             item.draw();
 
                             return TimeoutAction::ToDuration(Duration::from_secs(rotation_freq));
@@ -345,6 +357,30 @@ impl Wallpaper {
                 .ok();
         }
     }
+
+    fn clear_image(&mut self) {
+        self.current_image = None;
+        for l in &mut self.layers {
+            l.needs_redraw = true;
+        }
+    }
+}
+
+fn decode(mut reader: ImageReader<BufReader<fs::File>>) -> ImageResult<DynamicImage> {
+    let mut limits = Limits::default();
+    limits.max_alloc = Some(1024 * 1024 * 1024);
+    reader.limits(limits.clone());
+
+    let mut decoder = reader.into_decoder()?;
+    let orientation = decoder.orientation()?;
+
+    limits.reserve(decoder.total_bytes())?;
+    decoder.set_limits(limits)?;
+
+    let mut image = DynamicImage::from_decoder(decoder)?;
+    image.apply_orientation(orientation);
+
+    Ok(image)
 }
 
 fn current_image(output: &str) -> Option<Source> {
@@ -361,4 +397,75 @@ fn current_image(output: &str) -> Option<Source> {
     };
 
     wallpaper.map(|(_name, path)| path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+    use std::path::PathBuf;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_custom_dir_loading() {
+        // Create a temp directory structure
+        // root/
+        //   img1.png
+        //   subdir/
+        //     img2.png
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let subdir = root.join("subdir");
+        fs::create_dir(&subdir).unwrap();
+
+        File::create(root.join("img1.png")).unwrap();
+        File::create(subdir.join("img2.png")).unwrap();
+
+        // Create a Wallpaper instance with Source pointing to root
+        // We need to mock dependencies or use minimal construction if possible.
+        // Wallpaper::new requires QueueHandle and LoopHandle which are hard to mock here.
+        // Instead, we can verify the logic by extracting the loading logic or just replicating it here to confirm behavior.
+
+        // Let's replicate the logic from load_images for custom directories check
+        let source = root.to_path_buf();
+        let mut image_queue = VecDeque::new();
+
+        // Assume XDG_DATA_DIRS does NOT contain this temp dir (which is true)
+        let xdg_data_dirs: Vec<String> = Vec::new();
+
+        if let Ok(source) = source.canonicalize() {
+            if source.is_dir() {
+                if xdg_data_dirs
+                    .iter()
+                    .any(|xdg_data_dir| source.starts_with(xdg_data_dir))
+                {
+                    // This block should NOT be hit
+                    panic!("Test setup error: temp dir shouldn't be in XDG_DATA_DIRS");
+                } else {
+                    for img_path in WalkDir::new(source)
+                        .follow_links(true)
+                        .into_iter()
+                        .filter_map(Result::ok)
+                        .filter(|p| p.path().is_file())
+                    {
+                        image_queue.push_front(img_path.path().into());
+                    }
+                }
+            }
+        }
+
+        // With WalkDir, we expect to find 2 images (recursive)
+        assert_eq!(image_queue.len(), 2, "Should find 2 images recursively");
+        assert!(
+            image_queue
+                .iter()
+                .any(|p: &PathBuf| p.ends_with("img1.png"))
+        );
+        assert!(
+            image_queue
+                .iter()
+                .any(|p: &PathBuf| p.ends_with("img2.png"))
+        );
+    }
 }

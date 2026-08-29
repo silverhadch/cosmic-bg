@@ -1,12 +1,11 @@
-// SPDX-License-Identifier: MPL-2.0-only'
+// SPDX-License-Identifier: MPL-2.0
 
 use crate::{CosmicBg, CosmicBgLayer};
 use image::{DynamicImage, GenericImageView};
-use sctk::{
-    reexports::client::{protocol::wl_shm, QueueHandle},
-    shell::WaylandSurface,
-    shm::slot::{Buffer, CreateBufferError, SlotPool},
-};
+use sctk::reexports::client::QueueHandle;
+use sctk::reexports::client::protocol::wl_shm;
+use sctk::shell::WaylandSurface;
+use sctk::shm::slot::{Buffer, CreateBufferError, SlotPool};
 
 pub fn canvas(
     pool: &mut SlotPool,
@@ -45,14 +44,14 @@ pub fn layer_surface(
     layer: &mut CosmicBgLayer,
     queue_handle: &QueueHandle<CosmicBg>,
     buffer: &Buffer,
+    buffer_damage: (i32, i32),
 ) {
-    let width = layer.width;
-    let height = layer.height;
+    let (width, height) = layer.size.unwrap();
 
     let wl_surface = layer.layer.wl_surface();
 
     // Damage the entire window
-    wl_surface.damage_buffer(0, 0, width as i32, height as i32);
+    wl_surface.damage_buffer(0, 0, buffer_damage.0, buffer_damage.1);
 
     // Request our next frame
     layer
@@ -64,6 +63,8 @@ pub fn layer_surface(
     if let Err(why) = buffer.attach_to(wl_surface) {
         tracing::error!(?why, "buffer attachment failed");
     }
+
+    layer.viewport.set_destination(width as i32, height as i32);
 
     wl_surface.commit();
 }

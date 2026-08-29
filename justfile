@@ -65,19 +65,17 @@ run *args:
 install:
     install -Dm0755 {{bin-src}} {{bin-dst}}
     @just data/install
-    @just data/icons/install
 
 # Uninstalls installed files
 uninstall:
     rm {{bin-dst}}
     @just data/uninstall
-    @just data/icons/uninstall
 
 # Vendor dependencies locally
 vendor:
     mkdir -p .cargo
-    cargo vendor --sync Cargo.toml --sync config/Cargo.toml | head -n -1 > .cargo/config
-    echo 'directory = "vendor"' >> .cargo/config
+    cargo vendor --sync Cargo.toml --sync config/Cargo.toml | head -n -1 > .cargo/config.toml
+    echo 'directory = "vendor"' >> .cargo/config.toml
     tar pcf vendor.tar vendor
     rm -rf vendor
 
